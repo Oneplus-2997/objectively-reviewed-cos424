@@ -1,40 +1,37 @@
 #!/usr/bin/env python3
-"""Extract Pitchfork reviews into artist___album.txt UTF-8 text files.
+"""Extract Pitchfork reviews into source_id.txt files and a metadata manifest.
 
-The meta description is included as the first paragraph when present.
-
-Run without arguments to convert raw-html, or pass individual files/directories:
     python3 scripts/html_to_txt.py
-    python3 scripts/html_to_txt.py path/to/review.html
 
-Paths used by default are relative to this script, regardless of the working
-directory. Only Python's standard library is required.
-Skipped file paths and error reasons are saved to outputs/skipped_htmls.txt,
-replacing the previous run's list (empty when no files were skipped).
-Successful HTML/text filename pairs are saved to outputs/html_text_match.csv,
-replacing the previous run's mapping.
-Text filenames for reviews with no nonempty meta description are saved to
-outputs/missing_descriptions.txt, replacing the previous run's list.
+Names come from the first artist link and album heading, retaining punctuation.
+The first text paragraph is the meta description, followed by the review body.
+Stable IDs are derived from canonical URLs. All members of duplicate source-ID
+or artist/album/date groups are discarded and recorded in discarded_html.csv.
+Files without descriptions remain text files and appear in missing_descriptions.txt.
+The manifest and support reports are saved in outputs/extracting_text/.
+The previous text directory is archived when replacing it. Default paths are
+relative to this script, and only Python's standard library is required.
 """
 
 import argparse
-import csv
+from collections import Counter
 from html.parser import HTMLParser
+import json
 from pathlib import Path
-import re
 import sys
+import tempfile
+
+from review_common import (
+    EXTRACTION_OUTPUTS, MAP_FIELDS, OUTPUTS, canonical_url, duplicate_keys, match_key,
+    review_date, review_score, source_id_for_url, write_csv,
+)
 
 
-SCRIPT_DIR = Path(__file__).resolve().parent
-DEFAULT_INPUT = SCRIPT_DIR.parent / "pitchfork-scrape" / "raw-html"
-DEFAULT_OUTPUT = SCRIPT_DIR.parent / "outputs" / "text_reviews"
-SKIPPED_LOG = SCRIPT_DIR.parent / "outputs" / "skipped_htmls.txt"
-MATCH_CSV = SCRIPT_DIR.parent / "outputs" / "html_text_match.csv"
-MISSING_DESCRIPTION_LOG = SCRIPT_DIR.parent / "outputs" / "missing_descriptions.txt"
+DEFAULT_INPUT = OUTPUTS.parent / "pitchfork-scrape" / "raw-html"
 
 
 class ReviewParser(HTMLParser):
-    """Read the title, meta description, and Pitchfork review body paragraphs."""
+    """Read visible identity fields, JSON-LD, description, and review paragraphs."""
 
     VOID_TAGS = {
         "area", "base", "br", "col", "embed", "hr", "img", "input", "link",
@@ -45,16 +42,25 @@ class ReviewParser(HTMLParser):
     def __init__(self):
         super().__init__(convert_charrefs=True)
         self.stack = []
-        self.title_parts = []
+        self.values = {}
+        self.captures = {}
         self.description = ""
+        self.url = ""
+        self.og_url = ""
+        self.json_blocks = []
+        self.json_parts = None
+        self.json_depth = None
+        self.artist_list_depth = None
         self.paragraphs = []
         self.paragraph_parts = None
         self.review_depth = None
 
+    def capture(self, name):
+        if name not in self.values and name not in self.captures:
+            self.captures[name] = (len(self.stack), [])
+
     def finish_paragraph(self):
         if self.paragraph_parts is not None:
-            # Joining without added spaces preserves punctuation around inline
-            # links/emphasis. Split/join normalizes whitespace, including &nbsp;.
             paragraph = " ".join("".join(self.paragraph_parts).split())
             if paragraph:
                 self.paragraphs.append(paragraph)
@@ -63,28 +69,59 @@ class ReviewParser(HTMLParser):
     def handle_starttag(self, tag, attrs):
         ignored = any(name in self.IGNORED_TAGS for name in self.stack)
         attrs = dict(attrs)
-        if not ignored and tag == "meta" and not self.description:
-            if (attrs.get("name") or "").lower() == "description":
-                self.description = " ".join((attrs.get("content") or "").split())
-        if tag == "br" and self.paragraph_parts is not None and not ignored:
-            self.paragraph_parts.append(" ")
+        if not ignored:
+            if tag == "meta":
+                name = (attrs.get("name") or attrs.get("property") or "").lower()
+                if name == "description" and not self.description:
+                    self.description = " ".join((attrs.get("content") or "").split())
+                elif name == "og:url":
+                    self.og_url = attrs.get("content") or ""
+            if tag == "link" and "canonical" in (attrs.get("rel") or "").split():
+                self.url = attrs.get("href") or ""
+        if tag == "br" and not ignored:
+            if self.paragraph_parts is not None:
+                self.paragraph_parts.append(" ")
+            for _, parts in self.captures.values():
+                parts.append(" ")
         if tag in self.VOID_TAGS:
             return
         self.stack.append(tag)
+        if ignored:
+            return
         classes = (attrs.get("class") or "").split()
-        if not ignored and tag == "div" and "contents" in classes:
-            if self.review_depth is None:
-                self.review_depth = len(self.stack)
-        if self.review_depth is not None and tag == "p" and not ignored:
+        if tag == "script" and attrs.get("type") == "application/ld+json":
+            self.json_parts = []
+            self.json_depth = len(self.stack)
+        if tag == "ul" and "artist-links" in classes and "artist" not in self.values:
+            self.artist_list_depth = len(self.stack)
+        if tag == "li" and self.artist_list_depth is not None:
+            self.capture("artist")
+        if tag == "h1" and "single-album-tombstone__review-title" in classes:
+            self.capture("album")
+        if tag == "span" and "score" in classes:
+            self.capture("score")
+        if tag == "div" and "contents" in classes and self.review_depth is None:
+            self.review_depth = len(self.stack)
+        if tag == "p" and self.review_depth is not None:
             self.finish_paragraph()
             self.paragraph_parts = []
 
     def handle_endtag(self, tag):
         if tag not in self.stack:
             return
-        # Match the nearest open tag; void elements never enter the stack.
         index = len(self.stack) - 1 - self.stack[::-1].index(tag)
         ignored = any(name in self.IGNORED_TAGS for name in self.stack)
+        for name, (depth, parts) in list(self.captures.items()):
+            if index < depth:
+                value = " ".join("".join(parts).split())
+                # An empty first heading must not select a later album's name.
+                self.values[name] = value
+                del self.captures[name]
+        if self.json_depth is not None and index < self.json_depth:
+            self.json_blocks.append("".join(self.json_parts))
+            self.json_parts = self.json_depth = None
+        if self.artist_list_depth is not None and index < self.artist_list_depth:
+            self.artist_list_depth = None
         if tag == "p" and not ignored:
             self.finish_paragraph()
         if self.review_depth is not None and index < self.review_depth:
@@ -93,112 +130,160 @@ class ReviewParser(HTMLParser):
         del self.stack[index:]
 
     def handle_data(self, data):
+        if self.json_parts is not None:
+            self.json_parts.append(data)
+            return
         if any(tag in self.IGNORED_TAGS for tag in self.stack):
             return
-        if "title" in self.stack:
-            self.title_parts.append(data)
+        for _, parts in self.captures.values():
+            parts.append(data)
         if self.paragraph_parts is not None:
             self.paragraph_parts.append(data)
 
 
+def json_objects(value):
+    """Support plain JSON-LD objects, lists, and @graph documents."""
+    if isinstance(value, list):
+        for item in value:
+            yield from json_objects(item)
+    elif isinstance(value, dict):
+        yield value
+        if "@graph" in value:
+            yield from json_objects(value["@graph"])
+
+
 def extract_review(html):
-    """Return the title, combined review text, and normalized meta description."""
     parser = ReviewParser()
     parser.feed(html)
     parser.close()
     parser.finish_paragraph()
-    title = " ".join("".join(parser.title_parts).split())
-    if not title:
-        raise ValueError("no nonempty <title> tag found")
     if not parser.paragraphs:
         raise ValueError("no review paragraphs found in a div.contents container")
-    paragraphs = ([parser.description] if parser.description else []) + parser.paragraphs
-    return title, "\n\n".join(paragraphs) + "\n", parser.description
+    for field in ("artist", "album", "score"):
+        if not parser.values.get(field):
+            raise ValueError(f"no nonempty {field} field found in the review heading")
+    article = None
+    for block in parser.json_blocks:
+        try:
+            candidates = json_objects(json.loads(block))
+            article = next((obj for obj in candidates if obj.get("datePublished")), None)
+        except json.JSONDecodeError:
+            continue
+        if article:
+            break
+    if not article:
+        raise ValueError("no publication metadata found in JSON-LD")
+    author = article.get("author") or article.get("creator") or {}
+    if isinstance(author, list):
+        author = author[0] if len(author) == 1 else {}
+    author = author.get("name", "") if isinstance(author, dict) else author
+    author = " ".join((author or "").split())
+    if not author:
+        raise ValueError("no review author found")
+    url = canonical_url(parser.url or parser.og_url or article.get("url"))
+    return {
+        "source_id": source_id_for_url(url),
+        "artist": parser.values["artist"],
+        "album": parser.values["album"],
+        "reviewdate": review_date(article.get("datePublished")),
+        "reviewauthor": author,
+        "score": str(review_score(parser.values["score"])),
+        "description": parser.description,
+        "review": "\n\n".join(parser.paragraphs) + "\n",
+    }
 
 
-def output_name(title, number=1):
-    title = re.sub(r"\s+Album Review\s*\|\s*Pitchfork\s*$", "", title)
-    artist, separator, album = title.partition(":")
-    stem = f"{artist.strip()}___{album.strip()}" if separator else title.strip()
-    # Replace path separators and characters forbidden on common filesystems.
-    stem = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", stem).strip(" .")
-    stem = stem or "review"
-    suffix = "" if number == 1 else f" ({number})"
-    # Most filesystems limit a filename component to 255 bytes, not characters.
-    budget = 255 - len((suffix + ".txt").encode("utf-8"))
-    stem = stem.encode("utf-8")[:budget].decode("utf-8", errors="ignore")
-    return stem.rstrip(" .") + suffix + ".txt"
+def write_outputs(records, skipped, output_dir, reports_dir):
+    """Discard entire duplicate groups and replace the text directory together."""
+    duplicate_ids = {
+        value for value, count in Counter(row["source_id"] for row in records).items()
+        if count > 1
+    }
+    duplicated_keys = duplicate_keys(records)
+    kept, discarded = [], []
+    for record in records:
+        if record["source_id"] in duplicate_ids or match_key(record) in duplicated_keys:
+            discarded.append({
+                **{field: record[field] for field in MAP_FIELDS},
+                "discard_reason": "duplicate_html_review",
+            })
+        else:
+            kept.append(record)
+
+    output_dir.parent.mkdir(parents=True, exist_ok=True)
+    backup = None
+    with tempfile.TemporaryDirectory(prefix=".review_stage_", dir=output_dir.parent) as tmp:
+        stage = Path(tmp) / "text_reviews"
+        stage.mkdir()
+        for record in kept:
+            text = record["review"]
+            if record["description"]:
+                text = record["description"] + "\n\n" + text
+            (stage / record["text_file_name"]).write_text(text, encoding="utf-8")
+        if output_dir.exists():
+            backup = Path(tempfile.mkdtemp(prefix="previous_text_reviews_", dir=output_dir.parent))
+            output_dir.rename(backup / "text_reviews")
+        try:
+            stage.rename(output_dir)
+        except OSError:
+            if backup is not None:
+                (backup / "text_reviews").rename(output_dir)
+            raise
+
+    write_csv(
+        reports_dir / "html_text_match.csv", MAP_FIELDS,
+        [{field: row[field] for field in MAP_FIELDS} for row in kept],
+    )
+    write_csv(reports_dir / "discarded_html.csv", MAP_FIELDS + ["discard_reason"], discarded)
+    (reports_dir / "missing_descriptions.txt").write_text(
+        "".join(row["text_file_name"] + "\n" for row in kept if not row["description"]),
+        encoding="utf-8",
+    )
+    (reports_dir / "skipped_htmls.txt").write_text("".join(skipped), encoding="utf-8")
+    return len(kept), len(discarded), backup
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "inputs", nargs="*", type=Path,
-        help="HTML files or directories (default: pitchfork-scrape/raw-html)",
-    )
-    parser.add_argument(
-        "-o", "--output-dir", type=Path, default=DEFAULT_OUTPUT,
-        help="output directory (default: ../outputs/text_reviews beside script)",
-    )
+    parser.add_argument("inputs", nargs="*", type=Path)
+    parser.add_argument("-o", "--output-dir", type=Path, default=OUTPUTS / "text_reviews")
+    parser.add_argument("--reports-dir", type=Path, default=EXTRACTION_OUTPUTS)
     args = parser.parse_args()
     files = set()
     for source in args.inputs or [DEFAULT_INPUT]:
         if source.is_dir():
-            files.update(
-                path.resolve() for path in source.rglob("*")
-                if path.is_file() and path.suffix.lower() in {".html", ".htm"}
-            )
+            files.update(path.resolve() for path in source.rglob("*")
+                         if path.is_file() and path.suffix.lower() in {".html", ".htm"})
         elif source.is_file():
             files.add(source.resolve())
         else:
             parser.error(f"input does not exist: {source}")
     if not files:
         parser.error("no HTML files found")
-
-    args.output_dir.mkdir(parents=True, exist_ok=True)
-    SKIPPED_LOG.parent.mkdir(parents=True, exist_ok=True)
-    skipped = []
-    missing_descriptions = []
-    matches = []
-    used_names = set()
-    converted = failed = 0
-    for source in sorted(files):
+    records, skipped = [], []
+    for index, source in enumerate(sorted(files), 1):
         try:
-            title, review, description = extract_review(
-                source.read_text(encoding="utf-8-sig")
-            )
-            number = 1
-            name = output_name(title, number)
-            # Distinct pages can have identical titles or sanitize to the same
-            # filename. Keep both instead of overwriting within this batch.
-            while name.casefold() in used_names:
-                number += 1
-                name = output_name(title, number)
-            (args.output_dir / name).write_text(review, encoding="utf-8")
-            if not description:
-                missing_descriptions.append(name)
-            used_names.add(name.casefold())
-            matches.append((source.name, name))
-            converted += 1
+            record = extract_review(source.read_text(encoding="utf-8-sig"))
+            records.append({
+                **record, "html_file_name": source.name,
+                "text_file_name": record["source_id"] + ".txt",
+            })
         except (OSError, UnicodeError, ValueError) as exc:
-            print(f"Skipping {source.name}: {exc}", file=sys.stderr)
             skipped.append(f"{source}\t{exc}\n")
-            failed += 1
-    SKIPPED_LOG.write_text("".join(skipped), encoding="utf-8")
-    MISSING_DESCRIPTION_LOG.write_text(
-        "".join(f"{name}\n" for name in missing_descriptions), encoding="utf-8"
+            print(f"Skipping {source.name}: {exc}", file=sys.stderr)
+        if index % 2000 == 0:
+            print(f"Parsed {index}/{len(files)} HTML files.", flush=True)
+    if not records:
+        parser.error("no reviews could be extracted; previous outputs were preserved")
+    converted, discarded, backup = write_outputs(
+        records, skipped, args.output_dir, args.reports_dir
     )
-    with MATCH_CSV.open("w", encoding="utf-8", newline="") as mapping:
-        writer = csv.writer(mapping)
-        writer.writerow(["html_file_name", "text_file_name"])
-        writer.writerows(matches)
-    print(f"Converted {converted} file(s) to {args.output_dir}; {failed} failed.")
-    print(f"Filename mapping saved to {MATCH_CSV}")
-    print(
-        f"{len(missing_descriptions)} file(s) with review text but no description; "
-        f"text filenames saved to {MISSING_DESCRIPTION_LOG}"
-    )
-    return 1 if failed else 0
+    print(f"Wrote {converted} text files; discarded {discarded} duplicate HTMLs; skipped {len(skipped)}.")
+    if backup:
+        print(f"Previous text files archived in {backup}")
+    print(f"Metadata manifest and exclusion reports saved to {args.reports_dir}")
+    # Invalid source HTMLs are recorded; downstream stages can process valid ones.
+    return 0
 
 
 if __name__ == "__main__":
