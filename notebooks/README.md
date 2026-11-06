@@ -42,3 +42,16 @@ replacing it on another run.
 The extraction and merge notebooks are self-contained. The Python scripts in
 `scripts/` remain available as an alternative way to run those stages; see
 [scripts/README.md](../scripts/README.md).
+
+## Final notebook and NLP analysis
+
+[main_notebook.ipynb](../main_notebook.ipynb) is the consolidated end-to-end
+notebook. After cleaning, HTML extraction, and merging, its final section
+analyzes review language as a predictor of Pitchfork scores and Spotify audio
+features. It calls reusable modeling code in
+[`scripts/preliminary_results.py`](../scripts/preliminary_results.py) to run a
+held-out TF-IDF/Ridge baseline against a training-mean baseline and display
+selected word coefficients. The vocabulary and target scaling are fit on
+training rows only. This is an initial bag-of-words benchmark, not the proposed
+word-by-word embedding analysis. The baseline requires scikit-learn, listed in
+the repository's `requirements.txt`.
