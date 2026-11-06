@@ -243,25 +243,26 @@ def write_outputs(records, skipped, output_dir, reports_dir):
     return len(kept), len(discarded), backup
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("inputs", nargs="*", type=Path)
-    parser.add_argument("-o", "--output-dir", type=Path, default=OUTPUTS / "text_reviews")
-    parser.add_argument("--reports-dir", type=Path, default=EXTRACTION_OUTPUTS)
-    args = parser.parse_args()
+def find_html_files(inputs):
+    """Return unique, sorted source paths from HTML files or directories."""
     files = set()
-    for source in args.inputs or [DEFAULT_INPUT]:
+    for source in map(Path, inputs):
         if source.is_dir():
             files.update(path.resolve() for path in source.rglob("*")
                          if path.is_file() and path.suffix.lower() in {".html", ".htm"})
         elif source.is_file():
             files.add(source.resolve())
         else:
-            parser.error(f"input does not exist: {source}")
+            raise FileNotFoundError(f"input does not exist: {source}")
     if not files:
-        parser.error("no HTML files found")
+        raise ValueError("no HTML files found")
+    return sorted(files)
+
+
+def parse_html_files(files, progress_every=2000):
+    """Extract records and collect failures without replacing existing outputs."""
     records, skipped = [], []
-    for index, source in enumerate(sorted(files), 1):
+    for index, source in enumerate(files, 1):
         try:
             record = extract_review(source.read_text(encoding="utf-8-sig"))
             records.append({
@@ -271,10 +272,24 @@ def main():
         except (OSError, UnicodeError, ValueError) as exc:
             skipped.append(f"{source}\t{exc}\n")
             print(f"Skipping {source.name}: {exc}", file=sys.stderr)
-        if index % 2000 == 0:
+        if progress_every and index % progress_every == 0:
             print(f"Parsed {index}/{len(files)} HTML files.", flush=True)
     if not records:
-        parser.error("no reviews could be extracted; previous outputs were preserved")
+        raise ValueError("no reviews could be extracted; previous outputs were preserved")
+    return records, skipped
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("inputs", nargs="*", type=Path)
+    parser.add_argument("-o", "--output-dir", type=Path, default=OUTPUTS / "text_reviews")
+    parser.add_argument("--reports-dir", type=Path, default=EXTRACTION_OUTPUTS)
+    args = parser.parse_args()
+    try:
+        files = find_html_files(args.inputs or [DEFAULT_INPUT])
+        records, skipped = parse_html_files(files)
+    except (OSError, ValueError) as exc:
+        parser.error(str(exc))
     converted, discarded, backup = write_outputs(
         records, skipped, args.output_dir, args.reports_dir
     )

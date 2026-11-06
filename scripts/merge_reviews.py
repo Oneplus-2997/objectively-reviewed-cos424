@@ -38,7 +38,8 @@ def consistency_issues(data_row, text_row):
     return ";".join(issues)
 
 
-def merge_reviews(data_path, text_path, output_dir, discarded_html_path=None):
+def merge_reviews(data_path, text_path, output_dir, discarded_html_path=None, *, output_path=None):
+    """Write verified links and audit reports, returning counts for each input."""
     data_fields, data_rows = read_csv(data_path, MATCH_FIELDS)
     text_fields, text_rows = read_csv(text_path, REVIEW_FIELDS)
     if {"source_id", "description", "review"} & set(data_fields):
@@ -115,7 +116,9 @@ def merge_reviews(data_path, text_path, output_dir, discarded_html_path=None):
             reason = "review_date_mismatch" if key[:2] in data_pairs else "no_matching_metadata"
         text_unmatched.append({**text_row, "merge_reason": reason})
 
-    write_csv(output_dir / "full_review.csv", data_fields + ["source_id", "description", "review"], merged)
+    if output_path is None:
+        output_path = output_dir / "full_review.csv"
+    write_csv(output_path, data_fields + ["source_id", "description", "review"], merged)
     for filename, fields, rows in (
         ("data_clean_unmatched.csv", data_fields, data_unmatched),
         ("review_text_unmatched.csv", text_fields, text_unmatched),
@@ -129,7 +132,10 @@ def merge_reviews(data_path, text_path, output_dir, discarded_html_path=None):
 
     assert len(data_rows) == len(merged) + len(data_unmatched) + len(data_discarded)
     assert len(text_rows) == len(merged) + len(text_unmatched) + len(text_discarded)
+    assert len(matched_ids) == len(merged)
     return {
+        "data_rows": len(data_rows), "text_rows": len(text_rows),
+        "unique_source_ids": len(matched_ids),
         "merged": len(merged),
         "data_unmatched": len(data_unmatched), "text_unmatched": len(text_unmatched),
         "data_discarded": len(data_discarded), "text_discarded": len(text_discarded),
