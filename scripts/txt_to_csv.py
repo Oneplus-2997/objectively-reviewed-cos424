@@ -33,6 +33,32 @@ def review_row(path, metadata):
     }
 
 
+def build_review_csv(input_dir, manifest_path, missing_descriptions_path, output_path):
+    """Validate text files and write the review CSV; return rows and exclusions."""
+    if not input_dir.is_dir():
+        raise FileNotFoundError(f"input directory does not exist: {input_dir}")
+    _, manifest = read_csv(manifest_path, MAP_FIELDS)
+    excluded = set(missing_descriptions_path.read_text(encoding="utf-8-sig").splitlines())
+    rows, seen = [], set()
+    skipped = 0
+    for metadata in manifest:
+        source_id = metadata["source_id"]
+        name = metadata["text_file_name"]
+        if not re.fullmatch(r"[0-9a-f]{32}", source_id) or name != source_id + ".txt":
+            raise ValueError(f"invalid source ID/text filename in manifest: {name}")
+        if source_id in seen:
+            raise ValueError(f"duplicate source ID in manifest: {source_id}")
+        seen.add(source_id)
+        if name in excluded:
+            skipped += 1
+            continue
+        rows.append(review_row(input_dir / name, metadata))
+    assert len(manifest) == len(rows) + skipped
+    # Validate all input files before replacing the previous CSV.
+    write_csv(output_path, REVIEW_FIELDS, rows)
+    return rows, skipped
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input-dir", type=Path, default=OUTPUTS / "text_reviews")
@@ -40,27 +66,10 @@ def main():
     parser.add_argument("--missing-descriptions", type=Path, default=EXTRACTION_OUTPUTS / "missing_descriptions.txt")
     parser.add_argument("-o", "--output", type=Path, default=OUTPUTS / "review_text.csv")
     args = parser.parse_args()
-    if not args.input_dir.is_dir():
-        parser.error(f"input directory does not exist: {args.input_dir}")
     try:
-        _, manifest = read_csv(args.manifest, MAP_FIELDS)
-        excluded = set(args.missing_descriptions.read_text(encoding="utf-8-sig").splitlines())
-        rows, seen = [], set()
-        skipped = 0
-        for metadata in manifest:
-            source_id = metadata["source_id"]
-            name = metadata["text_file_name"]
-            if not re.fullmatch(r"[0-9a-f]{32}", source_id) or name != source_id + ".txt":
-                raise ValueError(f"invalid source ID/text filename in manifest: {name}")
-            if source_id in seen:
-                raise ValueError(f"duplicate source ID in manifest: {source_id}")
-            seen.add(source_id)
-            if name in excluded:
-                skipped += 1
-                continue
-            rows.append(review_row(args.input_dir / name, metadata))
-        # Validate all input files before replacing the previous CSV.
-        write_csv(args.output, REVIEW_FIELDS, rows)
+        rows, skipped = build_review_csv(
+            args.input_dir, args.manifest, args.missing_descriptions, args.output,
+        )
     except (OSError, UnicodeError, ValueError) as exc:
         parser.error(str(exc))
     print(f"Wrote {len(rows)} review(s) to {args.output}; excluded {skipped} without descriptions.")
