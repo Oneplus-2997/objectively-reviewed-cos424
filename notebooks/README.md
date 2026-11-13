@@ -48,10 +48,13 @@ The extraction and merge notebooks are self-contained. The Python scripts in
 [main_notebook.ipynb](../main_notebook.ipynb) is the consolidated end-to-end
 notebook. After cleaning, HTML extraction, and merging, its final section
 analyzes review language as a predictor of Pitchfork scores and Spotify audio
-features. It calls reusable modeling code in
-[`scripts/preliminary_results.py`](../scripts/preliminary_results.py) to run a
-held-out TF-IDF/Ridge baseline against a training-mean baseline and display
-selected word coefficients. The vocabulary and target scaling are fit on
-training rows only. This is an initial bag-of-words benchmark, not the proposed
-word-by-word embedding analysis. The baseline requires scikit-learn, listed in
-the repository's `requirements.txt`.
+features. The modeling code is separated into two modules:
+[`scripts/preliminary_results.py`](../scripts/preliminary_results.py) contains
+the shared split preparation and original TF-IDF/Ridge and ElasticNet baseline
+models, while [`scripts/nlp_improvements.py`](../scripts/nlp_improvements.py)
+contains the added cross-validated tuning and genre-comparison experiments. All
+models use the same prepared train/test split for direct comparison. The
+ElasticNet provides a sparse-coefficient alternative to Ridge, and the
+original baseline remains available. This is an initial bag-of-words
+benchmark, not the proposed word-by-word embedding analysis. The models
+require scikit-learn, listed in the repository's `requirements.txt`.
