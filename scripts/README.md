@@ -69,3 +69,10 @@ Run the regression checks with:
 ```bash
 python3 -m unittest discover -s scripts -p 'test_*.py' -v
 ```
+
+New author/date collection helpers live in
+[pitchfork_collection/](pitchfork_collection/README.md). They rank authors from
+root `data.csv`, collect current Pitchfork reviews published in 2023 and from
+2024 onward, and overwrite the latest results in `outputs/pitchfork_collection/`.
+They can be called from the command line or imported into a notebook and use
+only the Python 3.10 standard library.
