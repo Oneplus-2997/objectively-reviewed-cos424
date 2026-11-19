@@ -58,3 +58,12 @@ ElasticNet provides a sparse-coefficient alternative to Ridge, and the
 original baseline remains available. This is an initial bag-of-words
 benchmark, not the proposed word-by-word embedding analysis. The models
 require scikit-learn, listed in the repository's `requirements.txt`.
+
+The final section also reads the optional `pitchfork_collection.zip` archive
+(default path: `~/Downloads/pitchfork_collection.zip`) for a descriptive
+historical-versus-recent review comparison and a historical-to-recent score
+prediction check. The archive has no GenAI authorship labels, so these analyses
+cannot separate AI-assisted and human-written reviews; changes over time are
+not evidence of AI use. Update `PITCHFORK_COLLECTION_ZIP` in the notebook if
+the archive is stored elsewhere. The recent archive does not include Spotify
+audio features.
